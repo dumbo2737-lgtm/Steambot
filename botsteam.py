@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
-import hashlib
 import html
 import logging
 import re
 import sqlite3
+import unicodedata
 from datetime import datetime, time, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -55,6 +56,9 @@ API = "https://store.steampowered.com/api/featuredcategories/"
 FX_API = "https://open.er-api.com/v6/latest/UAH"
 REGIONS = {"ua": "UAH", "us": "USD", "de": "EUR", "ru": "RUB", "pl": "PLN", "fr": "EUR"}
 UPLOAD_PHOTO = 0
+SET_CHANNEL = 1
+SET_EMOJI = 2
+SET_CAMPAIGN = 3
 
 
 @contextmanager
@@ -75,13 +79,17 @@ def init_db() -> None:
     with db() as c:
         c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         c.execute("CREATE TABLE IF NOT EXISTS posts (id INTEGER PRIMARY KEY, posted_at TEXT, deals INTEGER, status TEXT)")
-        c.execute("""CREATE TABLE IF NOT EXISTS published_posts (
-            fingerprint TEXT NOT NULL,
+        c.execute("""CREATE TABLE IF NOT EXISTS scheduled_publications (
             posted_on TEXT NOT NULL,
-            posted_at TEXT NOT NULL,
-            deals INTEGER NOT NULL,
+            slot TEXT NOT NULL,
             status TEXT NOT NULL,
-            PRIMARY KEY (fingerprint, posted_on)
+            PRIMARY KEY (posted_on, slot)
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS daily_game_posts (
+            posted_on TEXT NOT NULL,
+            appid INTEGER NOT NULL,
+            slot TEXT NOT NULL,
+            PRIMARY KEY (posted_on, appid)
         )""")
 
 
@@ -96,30 +104,45 @@ def save_setting(key: str, value: str) -> None:
         c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
 
-def reserve_publication(fingerprint: str, posted_on: str, deal_count: int) -> bool:
-    posted_at = datetime.now(TIMEZONE).isoformat()
+def current_campaign_photo() -> str:
+    campaign_key = setting("campaign_key", "steam")
+    photo_id = setting(f"photo_id_{campaign_key}", "__unset__")
+    return setting("photo_id") if photo_id == "__unset__" else photo_id
+
+
+def reserve_daily_batch(posted_on: str, slot: str, deals: list[dict], limit: int = 8) -> list[dict] | None:
+    selected = []
     with db() as c:
         cursor = c.execute(
-            "INSERT OR IGNORE INTO published_posts(fingerprint,posted_on,posted_at,deals,status) VALUES(?,?,?,?,?)",
-            (fingerprint, posted_on, posted_at, deal_count, "sending"),
+            "INSERT OR IGNORE INTO scheduled_publications(posted_on,slot,status) VALUES(?,?,?)",
+            (posted_on, slot, "sending"),
         )
-        return cursor.rowcount == 1
+        if cursor.rowcount != 1:
+            return None
+        for deal in deals:
+            if len(selected) >= limit:
+                break
+            cursor = c.execute(
+                "INSERT OR IGNORE INTO daily_game_posts(posted_on,appid,slot) VALUES(?,?,?)",
+                (posted_on, int(deal["id"]), slot),
+            )
+            if cursor.rowcount == 1:
+                selected.append(deal)
+    return selected
 
 
-def finish_publication(fingerprint: str, posted_on: str) -> None:
+def finish_daily_batch(posted_on: str, slot: str) -> None:
     with db() as c:
         c.execute(
-            "UPDATE published_posts SET status='sent' WHERE fingerprint=? AND posted_on=?",
-            (fingerprint, posted_on),
+            "UPDATE scheduled_publications SET status='sent' WHERE posted_on=? AND slot=?",
+            (posted_on, slot),
         )
 
 
-def release_publication(fingerprint: str, posted_on: str) -> None:
+def release_daily_batch(posted_on: str, slot: str) -> None:
     with db() as c:
-        c.execute(
-            "DELETE FROM published_posts WHERE fingerprint=? AND posted_on=? AND status='sending'",
-            (fingerprint, posted_on),
-        )
+        c.execute("DELETE FROM daily_game_posts WHERE posted_on=? AND slot=?", (posted_on, slot))
+        c.execute("DELETE FROM scheduled_publications WHERE posted_on=? AND slot=?", (posted_on, slot))
 
 
 def is_admin(user_id: int | None) -> bool:
@@ -181,7 +204,36 @@ async def collect_deals() -> list[dict]:
                     d["prices"][currency] = pair
         d["prices"] = {k: v for k, v in d["prices"].items() if v[0] is not None}
     deals = [d for d in by_id.values() if d["prices"]]
-    return sorted(deals, key=lambda x: (x["score"], x["discount"]), reverse=True)
+    deals = sorted(deals, key=lambda x: (x["score"], x["discount"]), reverse=True)
+    if setting("campaign_filter", "all") == "ubisoft":
+        return await filter_ubisoft_games(deals)
+    return deals
+
+
+async def filter_ubisoft_games(deals: list[dict]) -> list[dict]:
+    timeout = aiohttp.ClientTimeout(total=25)
+    semaphore = asyncio.Semaphore(8)
+
+    async def is_ubisoft(session: aiohttp.ClientSession, deal: dict) -> bool:
+        async with semaphore:
+            try:
+                data = await get_json(
+                    session,
+                    "https://store.steampowered.com/api/appdetails/",
+                    appids=deal["id"], cc="us", l="english",
+                )
+                app = data.get(str(deal["id"]), {})
+                details = app.get("data", {}) if app.get("success") else {}
+                companies = details.get("publishers", []) + details.get("developers", [])
+                return any("ubisoft" in company.casefold() for company in companies)
+            except Exception as exc:
+                log.debug("Could not identify publisher for app %s: %s", deal["id"], exc)
+                return False
+
+    candidates = deals[:100]
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        checks = await asyncio.gather(*(is_ubisoft(session, deal) for deal in candidates))
+    return [deal for deal, matched in zip(candidates, checks) if matched]
 
 
 def money(amount: int, currency: str) -> str:
@@ -191,85 +243,99 @@ def money(amount: int, currency: str) -> str:
 def deal_line(d: dict) -> str:
     name = html.escape(d["name"])
     url = f"https://store.steampowered.com/app/{d['id']}/"
-    currencies = ("UAH", "USD", "EUR", "RUB")
+    currencies = (("UAH", "₴"), ("USD", "$"), ("RUB", "₽"))
     price_bits = []
-    for currency in currencies:
+    for currency, symbol in currencies:
         pair = d["prices"].get(currency)
         if pair:
-            now, old = pair
-            price_bits.append(f"{money(now, currency)}" + (f" (было {money(old, currency)})" if old else ""))
-    expiry = ""
-    if d.get("expiration"):
-        end = datetime.fromtimestamp(d["expiration"], timezone.utc).astimezone(TIMEZONE)
-        expiry = f" · до {end:%d.%m %H:%M} {end.tzname()}"
-    return f'• <a href="{url}">{name}</a> — <b>-{d["discount"]}%</b>\n  {" · ".join(price_bits)}{expiry}'
+            now, _old = pair
+            amount = money(now, currency).split()[0]
+            price_bits.append(f"{symbol}{amount}")
+    discount = int(d["discount"])
+    emoji_key, default_emoji = (
+        ("emoji_record", "🔥") if discount >= 90 else
+        ("emoji_high", "💥") if discount >= 50 else
+        ("emoji_simple", "🟢")
+    )
+    icon = html.escape(setting(emoji_key, default_emoji), quote=False)
+    return f'{icon} <a href="{url}"><b>{name}</b></a> — <b>-{discount}%</b>\n　<b>{"  |  ".join(price_bits)}</b>'
 
 
-def build_post(deals: list[dict]) -> str:
-    popular = [d for d in deals if d["top_regions"]][:6]
+def build_post(deals: list[dict], max_length: int = 3900) -> tuple[str, int]:
+    title = setting("title", "🎮 СКИДКИ STEAM")
+    selected = deals[:8]
+    popular = [d for d in selected if d["top_regions"]][:6]
     popular_ids = {d["id"] for d in popular}
-    rest = [d for d in deals if d["id"] not in popular_ids][:10]
-    title = setting("title", "🎮 STEAM DEALS")
-    lines = [f"<b>{html.escape(title)}</b>", "Актуальные цены Steam · названия игр на языке оригинала", ""]
+    rest = [d for d in selected if d["id"] not in popular_ids]
+    parts = [f"<b>{html.escape(title)}</b>"]
+    if not selected:
+        empty_text = "В этом выпуске нет новых скидок Ubisoft." if setting("campaign_filter", "all") == "ubisoft" else "В этом выпуске нет новых скидок без повторов."
+        parts.extend(["", empty_text])
     if popular:
-        lines.extend(["<b>🔥 Популярные скидки недели</b>", *(deal_line(d) for d in popular), ""])
+        rows = "\n".join(deal_line(d) for d in popular)
+        parts.extend(["", "<b>Популярные скидки недели</b>", rows])
     if rest:
-        lines.extend(["<b>💸 Другие скидки</b>", *(deal_line(d) for d in rest), ""])
-    lines.append("Цены в других валютах приблизительные и пересчитаны из UAH по текущему курсу. Проверяйте цену и срок скидки на странице Steam.")
-    return "\n".join(lines)
+        rows = "\n".join(deal_line(d) for d in rest)
+        parts.extend(["", "<b>Другие скидки</b>", rows])
+    expirations = [d["expiration"] for d in selected if d.get("expiration")]
+    if expirations:
+        end = datetime.fromtimestamp(min(expirations), timezone.utc).astimezone(TIMEZONE)
+        parts.extend(["", f"<i>Ближайшее окончание скидки: {end:%d.%m в %H:%M} EEST.</i>"])
+    text = "\n".join(parts)
+    plain_text = html.unescape(re.sub(r"<[^>]+>", "", text))
+    if len(plain_text.encode("utf-16-le")) // 2 > max_length:
+        raise RuntimeError("8 игр не помещаются в подпись к фото. Сократите длинный заголовок шаблона.")
+    return text, len(selected)
 
 
-async def publish(context: ContextTypes.DEFAULT_TYPE) -> str:
+async def publish(context: ContextTypes.DEFAULT_TYPE, slot: str = "manual") -> str:
     async with _PUBLISH_LOCK:
         deals = await collect_deals()
-        if not deals:
-            raise RuntimeError("Steam не вернул доступных предложений. Попробуйте позже.")
-        text = build_post(deals)
-        photo_id = setting("photo_id")
-        fingerprint = hashlib.sha256((text + "|" + photo_id).encode("utf-8")).hexdigest()
+        photo_id = current_campaign_photo()
+        if not photo_id:
+            raise RuntimeError("Сначала добавьте фото через /admin → Фото постов.")
         posted_on = datetime.now(TIMEZONE).date().isoformat()
-        if not reserve_publication(fingerprint, posted_on, min(len(deals), 16)):
-            return "Такой пост уже публиковался сегодня; повтор пропущен."
-
-        sent_any = False
+        selected = reserve_daily_batch(posted_on, slot, deals, limit=8)
+        if selected is None:
+            return "Этот выпуск уже опубликован."
         try:
-            if photo_id:
-                await context.bot.send_photo(chat_id=CHANNEL, photo=photo_id, caption="🎮 Актуальные скидки Steam", parse_mode=ParseMode.HTML)
-                sent_any = True
-            chunks: list[str] = []
-            chunk = ""
-            for line in text.splitlines():
-                candidate = f"{chunk}{chr(10)}{line}" if chunk else line
-                if len(candidate) > 3900 and chunk:
-                    chunks.append(chunk)
-                    chunk = line
-                else:
-                    chunk = candidate
-            if chunk:
-                chunks.append(chunk)
-            for part in chunks:
-                await context.bot.send_message(chat_id=CHANNEL, text=part, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-                sent_any = True
+            text, deal_count = build_post(selected, max_length=1000)
+            target_channel = setting("channel_username", str(CHANNEL))
+            await context.bot.send_photo(chat_id=target_channel, photo=photo_id, caption=text, parse_mode=ParseMode.HTML)
         except Exception:
-            if not sent_any:
-                release_publication(fingerprint, posted_on)
+            release_daily_batch(posted_on, slot)
             raise
         with db() as c:
-            c.execute("INSERT INTO posts(posted_at,deals,status) VALUES(?,?,?)", (datetime.now(TIMEZONE).isoformat(), min(len(deals), 16), "sent"))
-        finish_publication(fingerprint, posted_on)
-        return f"Опубликовано предложений: {min(len(deals), 16)}."
+            c.execute("INSERT INTO posts(posted_at,deals,status) VALUES(?,?,?)", (datetime.now(TIMEZONE).isoformat(), deal_count, "sent"))
+        finish_daily_batch(posted_on, slot)
+        return f"Опубликовано предложений: {deal_count}."
 
 async def scheduled_post(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        result = await publish(context)
+        slot = context.job.name if context.job else "scheduled"
+        result = await publish(context, slot=slot)
         log.info(result)
     except Exception:
         log.exception("Ошибка запланированной публикации")
 
 
+async def catch_up_missed_posts(application: Application) -> None:
+    now = datetime.now(TIMEZONE)
+    for value in POST_TIMES:
+        hour, minute = map(int, value.split(":"))
+        due = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if now >= due:
+            try:
+                await publish(SimpleNamespace(bot=application.bot), slot=f"post_{value}")
+            except Exception:
+                log.exception("Не удалось опубликовать пропущенный выпуск %s", value)
+
+
 def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🖼 Фото постов", callback_data="adm_photo"), InlineKeyboardButton("🎨 Шаблон", callback_data="adm_template")],
+        [InlineKeyboardButton("📣 Username канала", callback_data="adm_channel")],
+        [InlineKeyboardButton("😀 Смайлики скидок", callback_data="adm_emojis")],
         [InlineKeyboardButton("📤 Опубликовать сейчас", callback_data="adm_now"), InlineKeyboardButton("📊 Последний пост", callback_data="adm_status")],
         [InlineKeyboardButton("🗑 Удалить фото", callback_data="adm_nophoto")],
     ])
@@ -297,11 +363,28 @@ async def admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     action = q.data
     if action == "adm_photo":
-        await q.message.reply_text("Отправьте фото, которое будет добавляться перед каждой публикацией. Для отмены отправьте /cancel.")
+        await q.message.reply_text("Отправьте баннер для выбранной темы распродажи. Для отмены отправьте /cancel.")
         return UPLOAD_PHOTO
+    if action == "adm_channel":
+        current = setting("channel_username", str(CHANNEL))
+        await q.message.reply_text(f"Отправьте username публичного канала, например @mychannel. Сейчас: {html.escape(current)}. Для отмены отправьте /cancel.")
+        return SET_CHANNEL
+    if action == "adm_emojis":
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🟢 Обычная скидка", callback_data="emoji_simple")],
+            [InlineKeyboardButton("💥 Высокая скидка", callback_data="emoji_high")],
+            [InlineKeyboardButton("🔥 Рекордная скидка", callback_data="emoji_record")],
+        ])
+        await q.message.reply_text("Для какой категории изменить смайлик?", reply_markup=buttons)
+        return ConversationHandler.END
     if action == "adm_template":
-        buttons = InlineKeyboardMarkup([[InlineKeyboardButton("🎮 STEAM DEALS", callback_data="tpl_🎮 STEAM DEALS"), InlineKeyboardButton("⚡ Скидки Steam", callback_data="tpl_⚡ Скидки Steam")]])
-        await q.message.reply_text("Выберите заголовок шаблона:", reply_markup=buttons)
+        buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎮 Скидки Steam", callback_data="campaign_steam"), InlineKeyboardButton("🎯 Распродажа Ubisoft", callback_data="campaign_ubisoft")],
+            [InlineKeyboardButton("🍂 Осенняя распродажа", callback_data="campaign_autumn"), InlineKeyboardButton("☀️ Летняя распродажа", callback_data="campaign_summer")],
+            [InlineKeyboardButton("❄️ Зимняя распродажа", callback_data="campaign_winter"), InlineKeyboardButton("🌷 Весенняя распродажа", callback_data="campaign_spring")],
+            [InlineKeyboardButton("✏️ Свой заголовок", callback_data="campaign_custom")],
+        ])
+        await q.message.reply_text("Выберите тему. Для неё можно загрузить отдельный баннер через «Фото постов».", reply_markup=buttons)
     elif action == "adm_now":
         await q.message.reply_text("Собираю актуальные цены…")
         try:
@@ -313,8 +396,11 @@ async def admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             row = c.execute("SELECT posted_at,deals,status FROM posts ORDER BY id DESC LIMIT 1").fetchone()
         await q.message.reply_text(f"Последний пост: {row['posted_at']} · предложений: {row['deals']}" if row else "Публикаций пока не было.")
     elif action == "adm_nophoto":
-        save_setting("photo_id", "")
-        await q.message.reply_text("Фото удалено из шаблона.")
+        campaign_key = setting("campaign_key", "steam")
+        save_setting(f"photo_id_{campaign_key}", "")
+        if campaign_key == "steam":
+            save_setting("photo_id", "")
+        await q.message.reply_text("Баннер выбранной темы удалён.")
     return ConversationHandler.END
 
 
@@ -324,8 +410,66 @@ async def photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.photo:
         await update.message.reply_text("Отправьте фото или /cancel.")
         return UPLOAD_PHOTO
-    save_setting("photo_id", update.message.photo[-1].file_id)
-    await update.message.reply_text("Фото сохранено. Оно будет добавляться перед каждой автоматической публикацией.", reply_markup=admin_keyboard())
+    campaign_key = setting("campaign_key", "steam")
+    photo_id = update.message.photo[-1].file_id
+    save_setting(f"photo_id_{campaign_key}", photo_id)
+    if campaign_key == "steam":
+        save_setting("photo_id", photo_id)
+    await update.message.reply_text("Баннер сохранён для выбранной темы.", reply_markup=admin_keyboard())
+    return ConversationHandler.END
+
+
+async def channel_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    username = update.message.text.strip()
+    if not username.startswith("@"):
+        username = "@" + username
+    if not re.fullmatch(r"@[A-Za-z0-9_]{5,32}", username):
+        await update.message.reply_text("Некорректный username. Введите @имя_канала длиной 5–32 символа или /cancel.")
+        return SET_CHANNEL
+    save_setting("channel_username", username)
+    await update.message.reply_text(f"Канал сохранён: {html.escape(username)}. Убедитесь, что бот добавлен в канал администратором с правом публикации.", reply_markup=admin_keyboard())
+    return ConversationHandler.END
+
+
+async def emoji_tier_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not is_admin(q.from_user.id):
+        await q.answer("Нет доступа", show_alert=True)
+        return ConversationHandler.END
+    await q.answer()
+    tier = q.data.removeprefix("emoji_")
+    labels = {"simple": "обычной скидки", "high": "высокой скидки", "record": "рекордной скидки"}
+    if tier not in labels:
+        return ConversationHandler.END
+    context.user_data["emoji_tier"] = tier
+    await q.message.reply_text(f"Отправьте один смайлик для {labels[tier]} или /cancel.")
+    return SET_EMOJI
+
+
+async def emoji_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    emoji = update.message.text.strip()
+    allowed_categories = {"So", "Sk", "Mn", "Cf"}
+    has_emoji_symbol = any(unicodedata.category(char) in {"So", "Sk"} for char in emoji)
+    valid = (
+        bool(emoji)
+        and len(emoji) <= 16
+        and has_emoji_symbol
+        and all(unicodedata.category(char) in allowed_categories for char in emoji)
+    )
+    if not valid:
+        await update.message.reply_text("Отправьте один смайлик из панели эмодзи Telegram или /cancel.")
+        return SET_EMOJI
+    tier = context.user_data.pop("emoji_tier", "simple")
+    key = {"simple": "emoji_simple", "high": "emoji_high", "record": "emoji_record"}.get(tier)
+    if not key:
+        await update.message.reply_text("Категория не выбрана. Откройте /admin и попробуйте ещё раз.")
+        return ConversationHandler.END
+    save_setting(key, emoji)
+    await update.message.reply_text("Смайлик сохранён.", reply_markup=admin_keyboard())
     return ConversationHandler.END
 
 
@@ -339,6 +483,55 @@ async def template_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("Заголовок шаблона сохранён.")
 
 
+async def campaign_preset_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not is_admin(q.from_user.id):
+        await q.answer("Нет доступа", show_alert=True)
+        return ConversationHandler.END
+    await q.answer()
+    key = q.data.removeprefix("campaign_")
+    presets = {
+        "steam": ("🎮 СКИДКИ STEAM", "all"),
+        "ubisoft": ("🎯 Распродажа Ubisoft", "ubisoft"),
+        "autumn": ("🍂 Осенняя распродажа", "all"),
+        "summer": ("☀️ Летняя распродажа", "all"),
+        "winter": ("❄️ Зимняя распродажа", "all"),
+        "spring": ("🌷 Весенняя распродажа", "all"),
+    }
+    if key not in presets:
+        return ConversationHandler.END
+    title, campaign_filter = presets[key]
+    save_setting("campaign_key", key)
+    save_setting("campaign_filter", campaign_filter)
+    save_setting("title", title)
+    await q.edit_message_text(f"Тема выбрана: {title}. Баннер можно загрузить через /admin → Фото постов.")
+    return ConversationHandler.END
+
+
+async def custom_campaign_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not is_admin(q.from_user.id):
+        await q.answer("Нет доступа", show_alert=True)
+        return ConversationHandler.END
+    await q.answer()
+    await q.message.reply_text("Отправьте заголовок своей распродажи (до 64 символов) или /cancel.")
+    return SET_CAMPAIGN
+
+
+async def custom_campaign_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    title = update.message.text.strip()
+    if not title or len(title) > 64:
+        await update.message.reply_text("Заголовок должен быть длиной 1–64 символа. Попробуйте ещё раз или /cancel.")
+        return SET_CAMPAIGN
+    save_setting("campaign_key", "custom")
+    save_setting("campaign_filter", "all")
+    save_setting("title", title)
+    await update.message.reply_text("Тема сохранена. Баннер для неё можно добавить через /admin → Фото постов.", reply_markup=admin_keyboard())
+    return ConversationHandler.END
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Действие отменено.")
     return ConversationHandler.END
@@ -347,12 +540,22 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main() -> None:
     validate_config()
     init_db()
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(catch_up_missed_posts).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin))
     app.add_handler(ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_action, pattern=r"^adm_(photo|template|now|status|nophoto)$")],
-        states={UPLOAD_PHOTO: [MessageHandler(filters.PHOTO, photo_received), MessageHandler(filters.TEXT & ~filters.COMMAND, photo_received)]},
+        entry_points=[
+            CallbackQueryHandler(admin_action, pattern=r"^adm_(photo|channel|emojis|template|now|status|nophoto)$"),
+            CallbackQueryHandler(emoji_tier_selected, pattern=r"^emoji_(simple|high|record)$"),
+            CallbackQueryHandler(campaign_preset_selected, pattern=r"^campaign_(steam|ubisoft|autumn|summer|winter|spring)$"),
+            CallbackQueryHandler(custom_campaign_prompt, pattern=r"^campaign_custom$"),
+        ],
+        states={
+            UPLOAD_PHOTO: [MessageHandler(filters.PHOTO, photo_received), MessageHandler(filters.TEXT & ~filters.COMMAND, photo_received)],
+            SET_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, channel_received)],
+            SET_EMOJI: [MessageHandler(filters.TEXT & ~filters.COMMAND, emoji_received)],
+            SET_CAMPAIGN: [MessageHandler(filters.TEXT & ~filters.COMMAND, custom_campaign_received)],
+        },
         fallbacks=[CommandHandler("cancel", cancel)], allow_reentry=True))
     app.add_handler(CallbackQueryHandler(template_received, pattern=r"^tpl_"), group=1)
     for value in POST_TIMES:
